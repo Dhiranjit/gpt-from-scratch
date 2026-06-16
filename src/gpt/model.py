@@ -1,33 +1,39 @@
 from typing import Any
-
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, n_embed, n_head, block_size, dropout):
-        super().__init__()
-        assert n_embed % n_head == 0
 
-        self.n_embed   = n_embed
-        self.n_head    = n_head
-        self.head_size = n_embed // n_head
+@dataclass
+class GPTConfig:
+    block_size : int = 256
+    vocab_size : int = 32768
+    n_embed    : int = 384
+    n_head     : int = 8
+    n_layer    : int = 6
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embed % config.n_head == 0
+
+        self.n_embed   = config.n_embed
+        self.n_head    = config.n_head
+        self.head_size = config.n_embed // config.n_head
 
         # Key, query, value projections for all heads, combined in a single batch
         # (C, hs) for each of k, q, v in a single head -> (C, hs * nh) -> (C, C) for each k, q, v
-        self.c_attn = nn.Linear(n_embed, 3 * n_embed, bias=False)
+        self.c_attn = nn.Linear(config.n_embed, 3 * config.n_embed, bias=False)
 
         # Output projection (C, C)
-        self.c_proj = nn.Linear(n_embed, n_embed, bias=False)
+        self.c_proj = nn.Linear(config.n_embed, config.n_embed, bias=False)
 
-        # Regularization
-        self.attn_dropout = nn.Dropout(dropout)
-        self.resid_dropout = nn.Dropout(dropout)
-
-        # Causal Mask
-        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+        # Causal Mask (Not needed with flash attention)
+        # self.register_buffer("tril", torch.tril(torch.ones(config.block_size, config.block_size)), persistent=False)
 
     
     def forward(self, x):
@@ -37,55 +43,60 @@ class CausalSelfAttention(nn.Module):
         qkv = self.c_attn(x) 
 
         # Shapes: # (B, T, C)
-        q, k, v = qkv.split(C, dim=2) 
+        q, k, v = qkv.split(self.n_embed, dim=2) 
 
         # Shapes: (B, nh, T, hs)
         q = q.view(B, T, self.n_head, self.head_size).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.head_size).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_size).transpose(1, 2)
 
-        # Causal Attention Math
+        ### Manual implementation of scaled dot-product attention with causal masking
         # (B, nh, T, hs) @ (B, nh, hs, T) -> (B, nh, T, T)
-        scores = (q @ k.transpose(-2, -1)) * (self.head_size ** -0.5)
-        scores = scores.masked_fill(self.tril[:T, :T] == 0, float("-inf")) # type: ignore
-        scores = F.softmax(scores, dim=-1)
+        # scores = (q @ k.transpose(-2, -1)) * (self.head_size ** -0.5)
+        # scores = scores.masked_fill(self.tril[:T, :T] == 0, float("-inf")) # type: ignore
+        # attention = F.softmax(scores, dim=-1) # (B, nh, T, T)
 
-        # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-        y = scores @ v
+        # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs) 
+        # y = attention @ v
+        
+        # Switching to flash attention for fused kernal implementation
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # (B, nh, T, hs)
 
+        
         # (B, nh, T, hs) -> (B, T, nh, hs) -> (B, T, C)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         # Output projection (B, T, C) @ (C, C) -> (B, T, C)
-        y = self.resid_dropout(self.c_proj(y))
+        y = self.c_proj(y)
 
         return y
 
 
-class FeedFoward(nn.Module):
-    def __init__(self, n_embed, dropout):
+
+class MLP(nn.Module):
+    def __init__(self, config):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embed, 4 * n_embed),
+            nn.Linear(config.n_embed, 4 * config.n_embed),
             nn.GELU(),
-            nn.Linear(4 * n_embed, n_embed),
-            nn.Dropout(dropout)
+            nn.Linear(4 * config.n_embed, config.n_embed),
         )
     
     def forward(self, x):
         return self.net(x)
 
 
+
 class Block(nn.Module):
-    def __init__(self, n_embed, n_head, block_size, dropout):
+    def __init__(self, config):
         super().__init__()
         # Layer Normalization
-        self.ln1 = nn.LayerNorm(n_embed)
-        self.ln2 = nn.LayerNorm(n_embed)
+        self.ln1 = nn.LayerNorm(config.n_embed)
+        self.ln2 = nn.LayerNorm(config.n_embed)
 
         # Core sub-layers
-        self.MHA  = CausalSelfAttention(n_embed, n_head, block_size, dropout)
-        self.ffwd = FeedFoward(n_embed, dropout)
+        self.MHA  = CausalSelfAttention(config)
+        self.ffwd = MLP(config)
 
     def forward(self, x):
         x = x + self.MHA(self.ln1(x))
@@ -93,23 +104,25 @@ class Block(nn.Module):
         return x
 
 
+
 class GPT2(nn.Module):
-    def __init__(self, vocab_size, n_embed, n_head, n_layer, block_size, dropout):
+    def __init__(self, config):
         super().__init__()
         
+        self.config = config
         # Token + Positional emdeddings
-        self.token_embedding  = nn.Embedding(vocab_size, n_embed)
-        self.pos_embedding    = nn.Embedding(block_size, n_embed)
-        self.drop             = nn.Dropout(dropout)
+        self.token_embedding  = nn.Embedding(config.vocab_size, config.n_embed)
+        self.pos_embedding    = nn.Embedding(config.block_size, config.n_embed)
 
         # Transformer Blocks
         self.blocks = nn.ModuleList(
-            [Block(n_embed, n_head, block_size, dropout) for _ in range(n_layer)]
+            [Block(config) for _ in range(config.n_layer)]
         )
         
         # Final LayerNorm and Language Model Head
-        self.ln_f = nn.LayerNorm(n_embed)
-        self.lm_head = nn.Linear(n_embed, vocab_size, bias=False)
+        self.ln_f = nn.LayerNorm(config.n_embed)
+        self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
+        self.lm_head.weight = self.token_embedding.weight # Weight tying (Redues the param count and force the model to learn a better representation)
 
     
     def forward(self, idx, targets=None):
@@ -119,8 +132,8 @@ class GPT2(nn.Module):
         tok_emb = self.token_embedding(idx)
         # (T,) -> (T, C)
         pos_emb = self.pos_embedding(torch.arange(0, T, device=idx.device))
-        
-        x = self.drop(tok_emb + pos_emb)
+
+        x = tok_emb + pos_emb
 
         for block in self.blocks:
             x = block(x)
@@ -132,9 +145,22 @@ class GPT2(nn.Module):
             return logits, None 
         
         # Flatten Time + Batch for cross entropy
-        B, T, V = logits.shape
+        V = logits.shape[-1]
         loss = F.cross_entropy(logits.view(B*T, V), targets.view(B*T))
         return logits, loss
+    
+    def generate(self, idx, max_new_tokens, temperature=1.0):
+        """Streams tokens one step at a time. Yields the new token (B, 1) each step."""
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -self.config.block_size:]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :] / temperature # Take only the last time step (B, vocab_size)
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+            yield idx_next
+
+
 
         
 
