@@ -1,39 +1,48 @@
 import os
 import torch
 import math
+import argparse
 import numpy as np
 from tqdm import tqdm
-import torch.nn.functional as F
 
-from src.gpt.model import GPT2
-from src.gpt.tokenizer import BPETokenizer
+from src.gpt.model import GPT2, GPTConfig
+from tokenizer.bpe import BPETokenizer
+
+
+
+
+parser = argparse.ArgumentParser(description="Train GPT")
+parser.add_argument("--dataset", required=True)
+args = parser.parse_args()
 
 
 device      = "cuda" if torch.cuda.is_available() else "cpu"
-data_path   = "data/FineWebEdu/data.bin"
-merges_path = "data/FineWebEdu/merges.txt"
-save_path   = "models/FineWebEdu.pt"
+data_path   = f"data/{args.dataset}/data.bin"
+merges_path = f"data/{args.dataset}/merges.txt"
+save_path   = f"models/{args.dataset}.pt"
 
 
-tokenizer = BPETokenizer(
-     special_tokens={"<|endoftext|>": 8000}
-).load(merges_path)
-
+# Load the tokenizer
+tokenizer = BPETokenizer(special_tokens=["<|endoftext|>"]).load(merges_path)
 
 data = np.memmap(data_path,dtype=np.uint16, mode="r")
 n = int(0.9 * len(data))
+
+# Split the data into train and val
 train_data, val_data = data[:n], data[n:]
 
 
 ### CONFIG
-vocab_size = len(tokenizer.vocab)
-batch_size = 32
-n_embed    = 320
-n_head     = 8
-n_layer    = 6
-block_size = 256
-dropout    = 0.2
 eval_iters = 30
+
+
+config = GPTConfig(
+    block_size=256,
+    vocab_size=len(tokenizer.vocab),
+    n_embed=384,
+    n_head=8,
+    n_layer=8
+)
 
 
 def get_batch(data, block_size, batch_size, device):
@@ -51,38 +60,40 @@ def estimate_loss(model):
     for split, data in splits.items():
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            xb, yb = get_batch(data, block_size, batch_size, device)
-            _, loss = model(xb, yb)
-            losses[k] = loss
+            xb, yb = get_batch(data, config.block_size, batch_size, device)
+            with ctx:
+                _, loss = model(xb, yb)
+            losses[k] = loss.item()
         out[split] = losses.mean().item()
     model.train()
-    return out 
+    return out
 
 
 
-model = GPT2(
-    vocab_size,
-    n_embed,
-    n_head,
-    n_layer,
-    block_size,
-    dropout
-).to(device)
+model = GPT2(config=config).to(device)
 
-params_count = sum([p.numel() for p in model.parameters()])
+params_count = sum(p.numel() for p in model.parameters())
 print(f"{params_count/1e6:.2f}M Parameters")
 
+if device == "cuda":
+    model = torch.compile(model)
+
+raw_model = getattr(model, "_orig_mod", model) # Unwrap compiled model for saving / generate
 
 
-max_steps = 40000
-eval_interval = 200
+
+### TRAINING CONFIG
+max_steps     = 12000
+eval_interval = 500
+batch_size    = 32
 
 
-max_lr = 1e-3
-min_lr = 1e-4
+max_lr       = 1e-3
+min_lr       = 1e-4
 warmup_steps = max_steps // 20 # 5% of max_steps
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=max_lr, fused=True)
+use_fused = device == "cuda"
+optimizer = torch.optim.AdamW(model.parameters(), lr=max_lr, fused=use_fused)
 ctx = torch.autocast(device, dtype=torch.bfloat16)
 
 
@@ -95,17 +106,8 @@ def get_lr(step):
     return min_lr + coeff * (max_lr - min_lr)
 
 
-config = {
-    "vocab_size": vocab_size,
-    "n_embed"   : n_embed,
-    "n_head"    : n_head,
-    "n_layer"   : n_layer,
-    "block_size": block_size,
-    "dropout"   : dropout,
-}
 
 os.makedirs(os.path.dirname(save_path), exist_ok=True)
-best_val = float("inf")
 
 pbar = tqdm(range(max_steps), desc="GPT2 training", unit="steps")
 
@@ -127,21 +129,19 @@ for step in pbar:
             f"val {losses['val']:.4f} | lr {lr:.2e}"
         )
 
-        if losses["val"] < best_val:
-            best_val = losses["val"]
-            torch.save({
-                "model"    : model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "step"     : step,
-                "best_val" : best_val,
-                "config"   : config,
-            }, save_path)
-
-    xb, yb = get_batch(train_data, block_size, batch_size, device)
+    xb, yb = get_batch(train_data, config.block_size, batch_size, device)
 
     with ctx:
         logits, loss = model(xb, yb)
-    
+
     optimizer.zero_grad()
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
+
+
+# Save final model
+torch.save({
+    "model"  : raw_model.state_dict(),
+    "config" : config,
+}, save_path)

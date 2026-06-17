@@ -31,10 +31,10 @@ class CausalSelfAttention(nn.Module):
 
         # Output projection (C, C)
         self.c_proj = nn.Linear(config.n_embed, config.n_embed, bias=False)
+        self.c_proj.NANOGPT_SCALE_INIT = True # Scale residual projection init by 1/sqrt(2*n_layer)
 
         # Causal Mask (Not needed with flash attention)
         # self.register_buffer("tril", torch.tril(torch.ones(config.block_size, config.block_size)), persistent=False)
-
     
     def forward(self, x):
         B, T, C = x.shape
@@ -72,7 +72,6 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
-
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -81,10 +80,10 @@ class MLP(nn.Module):
             nn.GELU(),
             nn.Linear(4 * config.n_embed, config.n_embed),
         )
+        self.net[2].NANOGPT_SCALE_INIT = True # Scale residual projection init by 1/sqrt(2*n_layer)
     
     def forward(self, x):
         return self.net(x)
-
 
 
 class Block(nn.Module):
@@ -102,7 +101,6 @@ class Block(nn.Module):
         x = x + self.MHA(self.ln1(x))
         x = x + self.ffwd(self.ln2(x))
         return x
-
 
 
 class GPT2(nn.Module):
@@ -124,7 +122,20 @@ class GPT2(nn.Module):
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
         self.lm_head.weight = self.token_embedding.weight # Weight tying (Redues the param count and force the model to learn a better representation)
 
-    
+        # Initialize weights (GPT-2 style)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if getattr(module, "NANOGPT_SCALE_INIT", False):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(self, idx, targets=None):
         B, T = idx.shape
 
