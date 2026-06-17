@@ -1,4 +1,4 @@
-# Deep Learning from Scratch
+# GPT from Scratch
 
 A personal learning journey building neural networks from the ground up — no shortcuts, mostly from scratch.
 
